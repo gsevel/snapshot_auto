@@ -1,6 +1,6 @@
 import boto3
 import click
-import time
+import botocore
 
 session = boto3.Session(profile_name="shotty")
 ec2 = session.resource('ec2')
@@ -14,6 +14,10 @@ def filter_instances(project):
         instances = ec2.instances.all()
     "Return instance iterator"
     return instances
+
+def has_pending_snapshot(volume):
+    snapshots = list(volume.snapshots.all())
+    return snapshots and snapshots[0].state == 'pending'
 
 @click.group()
 def cli():
@@ -51,7 +55,9 @@ def snapshots():
 @snapshots.command('list')
 @click.option('--project', default=None,
     help="Only instances for project (tag Project:<name>)")
-def list_snapshots(project):
+@click.option('--all', 'list_all', default=False, is_flag=True,
+    help="List all of the snapshots, not just the most recent successful.")
+def list_snapshots(project, list_all):
     "List EC2 Snapshots"
     instances = filter_instances(project)
 
@@ -70,6 +76,8 @@ def list_snapshots(project):
                     s.encrypted and "Encrypted" or "Not Encrypted",
                     tags.get('Project', '<no project>')
                     )))
+                if s.state == "completed" and not list_all:
+                    break
     return
 
 @cli.group('instances')
@@ -80,7 +88,7 @@ def instances():
     help="Create snapshots of all volumes")
 @click.option('--project', default=None,
     help="Only instances for project (tag Project:<name>)")
-@click.option('--verbose', default=False,
+@click.option('--verbose', 'verbose', default=False, is_flag=True,
     help="Print verbose output")
 def snapshot_env(project, verbose):
     "Snapshot EC2 Instances"
@@ -88,21 +96,26 @@ def snapshot_env(project, verbose):
 
     for i in instances:
         print("Stopping instance {0}...".format(i.id))
-        i.stop()
-
-    for i in instances:
-        i.reload()
-        while i.state['Code'] != 80:
-            time.sleep(1)
-            if verbose:
-                print(".", end="", flush=True)
-            i.reload()
+        try:
+            i.stop()
+        except botocore.exceptions.ClientError as e:
+            print("Count not stop {0}. ".format(i.id) + str(e))
+            continue
+        i.wait_until_stopped()
         if verbose:
             print("\nInstance {0} is {1}".format(i.id,i.state['Name']),
                 flush=True)
         for v in i.volumes.all():
-            print("Creating snapshot of {0}".format(v.volume_id))
-            response = v.create_snapshot(Description="Created by AutoShotty")
+            if has_pending_snapshot(v):
+                print("Snapshot of {0} already in progress, skipping.".format(
+                    v.volume_id
+                    ))
+            else:
+                print("Creating snapshot of {0}".format(v.volume_id))
+                response = v.create_snapshot(Description="Created by AutoShotty")
+        i.start()
+        i.wait_until_running()
+
     return
 
 @instances.command('list')
@@ -135,12 +148,17 @@ def stop_instances(project):
     "Iterate through instances and stop, printing their ID."
     for i in instances:
         print("Stopping instance {0}...".format(i.id))
-        i.stop()
+        try:
+            i.stop()
+        except botocore.exceptions.ClientError as e:
+            print("Count not stop {0}. ".format(i.id) + str(e))
+            continue
+    return
 
 @instances.command('start')
 @click.option('--project', default=None,
     help="Only instances for project (tag Project:<name>)")
-def stop_instances(project):
+def start_instances(project):
     "Start EC2 Instances"
 
     "filter instances by project if supplied"
@@ -148,7 +166,12 @@ def stop_instances(project):
     "Iterate through instances and start, printing their ID."
     for i in instances:
         print("Starting instance {0}...".format(i.id))
-        i.start()
+        try:
+            i.start()
+        except botocore.exceptions.ClientError as e:
+            print("Count not start {0}. ".format(i.id) + str(e))
+            continue
+    return
 
 if __name__ == '__main__':
     cli()
